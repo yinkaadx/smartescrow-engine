@@ -2,10 +2,10 @@
 pragma solidity 0.8.35;
 
 /// @title SmartEscrow
-/// @notice Provides controlled ETH funding and milestone scheduling for a
-/// client-contractor escrow agreement.
-/// @dev Payment release, disputes, and refunds are introduced incrementally
-/// with unit, fuzz, and invariant tests.
+/// @notice Provides controlled ETH funding, milestone scheduling, work review,
+/// and approved milestone payments for a client-contractor escrow agreement.
+/// @dev Disputes and refunds are introduced incrementally with unit, fuzz,
+/// and invariant tests.
 contract SmartEscrow {
     uint256 public constant MAX_MILESTONES = 50;
 
@@ -54,6 +54,7 @@ contract SmartEscrow {
     error EmptyReviewHash();
     error MilestoneDeadlinePassed(uint256 deadline, uint256 currentTime);
     error InvalidMilestoneStatus(MilestoneStatus expected, MilestoneStatus actual);
+    error PaymentTransferFailed();
 
     event EscrowCreated(
         address indexed client,
@@ -80,6 +81,10 @@ contract SmartEscrow {
         uint256 indexed milestoneId, address indexed client, bytes32 indexed reviewHash
     );
 
+    event MilestonePaid(uint256 indexed milestoneId, address indexed contractor, uint256 amount);
+
+    event EscrowCompleted(address indexed contractor, uint256 totalReleased);
+
     address public immutable client;
     address public immutable contractor;
     address public immutable arbiter;
@@ -88,6 +93,7 @@ contract SmartEscrow {
     uint256 public totalDeposited;
     uint256 public totalAllocated;
     uint256 public totalApproved;
+    uint256 public totalReleased;
 
     EscrowState public state;
 
@@ -304,6 +310,48 @@ contract SmartEscrow {
         milestone.status = MilestoneStatus.Rejected;
 
         emit MilestoneRejected(milestoneId, msg.sender, reviewHash);
+    }
+
+    /// @notice Releases one approved milestone payment to the contractor.
+    /// @dev Uses Checks-Effects-Interactions. A failed transfer reverts all
+    /// milestone, accounting, and escrow-state changes.
+    function releaseMilestonePayment(
+        uint256 milestoneId
+    ) external onlyContractor {
+        if (state != EscrowState.Active) {
+            revert InvalidState(EscrowState.Active, state);
+        }
+
+        if (milestoneId >= milestones.length) {
+            revert InvalidMilestoneId(milestoneId);
+        }
+
+        Milestone storage milestone = milestones[milestoneId];
+
+        if (milestone.status != MilestoneStatus.Approved) {
+            revert InvalidMilestoneStatus(MilestoneStatus.Approved, milestone.status);
+        }
+
+        uint256 amount = milestone.amount;
+        uint256 updatedTotalReleased = totalReleased + amount;
+        bool completesEscrow = updatedTotalReleased == totalDeposited;
+
+        milestone.status = MilestoneStatus.Paid;
+        totalReleased = updatedTotalReleased;
+
+        if (completesEscrow) {
+            state = EscrowState.Completed;
+        }
+
+        emit MilestonePaid(milestoneId, msg.sender, amount);
+
+        if (completesEscrow) {
+            emit EscrowCompleted(msg.sender, updatedTotalReleased);
+        }
+
+        (bool success,) = payable(contractor).call{ value: amount }("");
+
+        if (!success) revert PaymentTransferFailed();
     }
 
     function milestoneCount() external view returns (uint256) {
