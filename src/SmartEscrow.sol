@@ -28,6 +28,11 @@ contract SmartEscrow {
         Refunded
     }
 
+    enum DisputeRuling {
+        ContractorAward,
+        ClientRefund
+    }
+
     struct Milestone {
         uint256 amount;
         uint256 deadline;
@@ -55,6 +60,9 @@ contract SmartEscrow {
     error MilestoneDeadlinePassed(uint256 deadline, uint256 currentTime);
     error InvalidMilestoneStatus(MilestoneStatus expected, MilestoneStatus actual);
     error PaymentTransferFailed();
+    error EmptyDisputeEvidenceHash();
+    error EmptyResolutionHash();
+    error MilestoneNotDisputable(MilestoneStatus actual);
 
     event EscrowCreated(
         address indexed client,
@@ -83,7 +91,19 @@ contract SmartEscrow {
 
     event MilestonePaid(uint256 indexed milestoneId, address indexed contractor, uint256 amount);
 
-    event EscrowCompleted(address indexed contractor, uint256 totalReleased);
+    event EscrowCompleted(address indexed recipient, uint256 totalSettled);
+
+    event DisputeOpened(
+        uint256 indexed milestoneId, address indexed openedBy, bytes32 indexed evidenceHash
+    );
+
+    event DisputeResolved(
+        uint256 indexed milestoneId,
+        address indexed arbiter,
+        DisputeRuling indexed ruling,
+        bytes32 resolutionHash,
+        uint256 amount
+    );
 
     address public immutable client;
     address public immutable contractor;
@@ -94,8 +114,15 @@ contract SmartEscrow {
     uint256 public totalAllocated;
     uint256 public totalApproved;
     uint256 public totalReleased;
+    uint256 public totalRefunded;
+
+    bool public hasActiveDispute;
+    uint256 public activeDisputeMilestoneId;
 
     EscrowState public state;
+
+    mapping(uint256 milestoneId => bytes32 evidenceHash) public disputeEvidenceHashes;
+    mapping(uint256 milestoneId => bytes32 resolutionHash) public resolutionHashes;
 
     Milestone[] private milestones;
 
@@ -334,7 +361,7 @@ contract SmartEscrow {
 
         uint256 amount = milestone.amount;
         uint256 updatedTotalReleased = totalReleased + amount;
-        bool completesEscrow = updatedTotalReleased == totalDeposited;
+        bool completesEscrow = updatedTotalReleased + totalRefunded == totalDeposited;
 
         milestone.status = MilestoneStatus.Paid;
         totalReleased = updatedTotalReleased;
@@ -346,10 +373,108 @@ contract SmartEscrow {
         emit MilestonePaid(milestoneId, msg.sender, amount);
 
         if (completesEscrow) {
-            emit EscrowCompleted(msg.sender, updatedTotalReleased);
+            emit EscrowCompleted(msg.sender, updatedTotalReleased + totalRefunded);
         }
 
         (bool success,) = payable(contractor).call{ value: amount }("");
+
+        if (!success) revert PaymentTransferFailed();
+    }
+
+    /// @notice Opens arbitration for submitted or rejected milestone work.
+    /// @param milestoneId Zero-based milestone identifier.
+    /// @param evidenceHash Hash of the off-chain dispute evidence.
+    function openDispute(
+        uint256 milestoneId,
+        bytes32 evidenceHash
+    ) external {
+        if (msg.sender != client && msg.sender != contractor) {
+            revert Unauthorized();
+        }
+
+        if (state != EscrowState.Active) {
+            revert InvalidState(EscrowState.Active, state);
+        }
+
+        if (milestoneId >= milestones.length) {
+            revert InvalidMilestoneId(milestoneId);
+        }
+
+        Milestone storage milestone = milestones[milestoneId];
+
+        if (
+            milestone.status != MilestoneStatus.Submitted
+                && milestone.status != MilestoneStatus.Rejected
+        ) {
+            revert MilestoneNotDisputable(milestone.status);
+        }
+
+        if (evidenceHash == bytes32(0)) {
+            revert EmptyDisputeEvidenceHash();
+        }
+
+        milestone.status = MilestoneStatus.Disputed;
+        disputeEvidenceHashes[milestoneId] = evidenceHash;
+        activeDisputeMilestoneId = milestoneId;
+        hasActiveDispute = true;
+        state = EscrowState.Disputed;
+
+        emit DisputeOpened(milestoneId, msg.sender, evidenceHash);
+    }
+
+    /// @notice Resolves the active milestone dispute and settles its funds.
+    /// @param ruling Determines whether funds go to the contractor or client.
+    /// @param resolutionHash Hash of the arbiter's off-chain ruling.
+    /// @dev Uses Checks-Effects-Interactions. A failed transfer reverts every
+    /// milestone, accounting, dispute-tracking, and escrow-state effect.
+    function resolveDispute(
+        DisputeRuling ruling,
+        bytes32 resolutionHash
+    ) external onlyArbiter {
+        if (state != EscrowState.Disputed) {
+            revert InvalidState(EscrowState.Disputed, state);
+        }
+
+        if (resolutionHash == bytes32(0)) {
+            revert EmptyResolutionHash();
+        }
+
+        uint256 milestoneId = activeDisputeMilestoneId;
+        Milestone storage milestone = milestones[milestoneId];
+
+        if (milestone.status != MilestoneStatus.Disputed) {
+            revert InvalidMilestoneStatus(MilestoneStatus.Disputed, milestone.status);
+        }
+
+        uint256 amount = milestone.amount;
+        address recipient;
+
+        if (ruling == DisputeRuling.ContractorAward) {
+            milestone.status = MilestoneStatus.Paid;
+            totalReleased += amount;
+            recipient = contractor;
+        } else {
+            milestone.status = MilestoneStatus.Refunded;
+            totalRefunded += amount;
+            recipient = client;
+        }
+
+        resolutionHashes[milestoneId] = resolutionHash;
+        hasActiveDispute = false;
+        activeDisputeMilestoneId = 0;
+
+        uint256 totalSettled = totalReleased + totalRefunded;
+        bool completesEscrow = totalSettled == totalDeposited;
+
+        state = completesEscrow ? EscrowState.Completed : EscrowState.Active;
+
+        emit DisputeResolved(milestoneId, msg.sender, ruling, resolutionHash, amount);
+
+        if (completesEscrow) {
+            emit EscrowCompleted(recipient, totalSettled);
+        }
+
+        (bool success,) = payable(recipient).call{ value: amount }("");
 
         if (!success) revert PaymentTransferFailed();
     }
